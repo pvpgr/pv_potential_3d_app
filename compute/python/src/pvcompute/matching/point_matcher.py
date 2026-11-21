@@ -16,7 +16,7 @@ import numpy as np
 import shapely
 from shapely.geometry.base import BaseGeometry
 
-from pvcompute.models import BuildingPoints, Footprint, PointCloud
+from pvcompute.data_models import BuildingPoints, Footprint, PointCloud
 
 
 class PointMatcher:

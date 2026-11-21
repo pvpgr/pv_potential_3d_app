@@ -15,10 +15,10 @@ from pathlib import Path
 
 from shapely.geometry import Polygon
 
-from pvcompute.models import BuildingResult, Footprint, RoofFace
+from pvcompute.data_models import BuildingResult, Footprint, RoofFace
 
 
-class ComputeResultReader:
+class OutputJsonReader:
     def __init__(self, input_path: str | Path, output_path: str | Path):
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)

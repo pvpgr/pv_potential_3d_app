@@ -21,8 +21,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from pvcompute.geo import BoundingBox
-from pvcompute.models import PvgisAxes, PvgisTable
+from pvcompute.coordinates import BoundingBox
+from pvcompute.data_models import PvgisAxes, PvgisTable
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class PvgisHttpClient:
             return body[:300]
 
 
-class PvgisClient:
+class PvgisReader:
     """Fetches the PVGIS table from the PVcalc service."""
 
     URL = "https://re.jrc.ec.europa.eu/api/v5_3/PVcalc"
@@ -75,7 +75,7 @@ class PvgisClient:
     def __init__(self, http: PvgisHttpClient | None = None):
         self.http = http or PvgisHttpClient()
 
-    def get_table(self, area: BoundingBox, axes: PvgisAxes) -> PvgisTable:
+    def read(self, area: BoundingBox, axes: PvgisAxes) -> PvgisTable:
         """Table for the center of `area` (EPSG:2180)."""
         lat, lon = area.center_wgs84()
         log.info("fetching PVGIS table for lat=%s lon=%s (%d requests)", lat, lon, axes.request_count)

@@ -21,10 +21,10 @@ from pathlib import Path
 
 import numpy as np
 
-from pvcompute.models import BuildingPoints, Footprint, PvgisTable
+from pvcompute.data_models import BuildingPoints, Footprint, PvgisTable
 
 
-class InputFileWriter:
+class InputJsonWriter:
     DECIMALS = 2
 
     def __init__(self, path: str | Path):

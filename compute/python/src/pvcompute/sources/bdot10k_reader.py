@@ -14,8 +14,8 @@ from pathlib import Path
 
 import geopandas as gpd
 
-from pvcompute.geo import TARGET_CRS, BoundingBox
-from pvcompute.models import Footprint
+from pvcompute.coordinates import TARGET_CRS, BoundingBox
+from pvcompute.data_models import Footprint
 
 log = logging.getLogger(__name__)
 

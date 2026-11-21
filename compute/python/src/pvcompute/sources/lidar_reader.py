@@ -17,8 +17,8 @@ import laspy
 import numpy as np
 from pyproj import CRS, Transformer
 
-from pvcompute.geo import TARGET_CRS, BoundingBox, is_target_crs
-from pvcompute.models import PointCloud
+from pvcompute.coordinates import TARGET_CRS, BoundingBox, is_target_crs
+from pvcompute.data_models import PointCloud
 
 log = logging.getLogger(__name__)
 

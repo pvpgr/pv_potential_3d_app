@@ -17,7 +17,7 @@ from collections.abc import Sequence
 
 import psycopg
 
-from pvcompute.models import BuildingResult
+from pvcompute.data_models import BuildingResult
 
 
 class BuildingRepository:
