@@ -1,0 +1,24 @@
+# Tells git which files NOT to keep in the repository: local environments, build output
+# and large data files that every developer or the server has on its own disk.
+# Design doc: 5.2 (source and intermediate files live on the server disk, not in the container image).
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# C++ / CMake
+build/
+out/
+cmake-build-*/
+
+# Node
+node_modules/
+dist/
+
+# Source and intermediate data (BDOT10k, LiDAR, input.json, output.json) stay on disk, not in git
+compute/data/
+
+# Local env
+.env

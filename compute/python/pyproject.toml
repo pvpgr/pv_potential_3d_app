@@ -1,0 +1,24 @@
+# Describes the Python package of the compute module (pvcompute): its name and the libraries it needs.
+# Install it with `pip install -e .` inside compute/python.
+# Libraries as in the design doc: laspy (LiDAR files), GeoPandas (BDOT10k, coordinates),
+# psycopg (database); numpy holds the point arrays.
+# Design doc: 2.4 "Niezbędne biblioteki".
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pvcompute"
+version = "0.1.0"
+description = "Compute module, Python part: input.json preparation and loading results into the database"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "laspy[lazrs]>=2.5",
+    "geopandas>=0.14",
+    "psycopg[binary]>=3.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
