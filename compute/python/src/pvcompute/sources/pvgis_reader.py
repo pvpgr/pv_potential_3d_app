@@ -15,103 +15,95 @@ Design doc: 2.1, block "Pobranie danych PVGIS"; 2.4 "Dane z PVGIS".
 from __future__ import annotations
 
 import json
-import logging
-import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from pvcompute.coordinates import BoundingBox
-from pvcompute.data_models import PvgisAxes, PvgisTable
-
-log = logging.getLogger(__name__)
+from pvcompute.area import Area
+from pvcompute.data_models import PvgisTable
 
 
 class PvgisError(RuntimeError):
-    pass
+    """PVGIS could not be reached or returned an error."""
 
 
-class PvgisHttpClient:
-    """GET returning parsed JSON, with retries on rate limiting and server errors."""
+class PvgisReader:
+    """Downloads the PVGIS sunlight table for the center of an area."""
 
-    RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+    URL = "https://re.jrc.ec.europa.eu/api/v5_3/PVcalc"
+    SYSTEM_LOSS_PERCENT = 14.0
+    TIMEOUT_SECONDS = 60
 
-    def __init__(self, attempts: int = 3, timeout: float = 60):
-        self.attempts = attempts
-        self.timeout = timeout
+    def read(self, area: Area, slopes: list[float], azimuths: list[float]) -> PvgisTable:
+        """Download the table for the center of `area`: one value per slope and compass azimuth.
 
-    def get(self, url: str) -> dict:
-        request = Request(url, headers={"User-Agent": "pvcompute/0.1"})
-        for attempt in range(1, self.attempts + 1):
-            last = attempt == self.attempts
-            try:
-                with urlopen(request, timeout=self.timeout) as response:
-                    return json.load(response)
-            except HTTPError as exc:
-                body = exc.read().decode("utf-8", "replace")
-                if exc.code not in self.RETRY_STATUS or last:
-                    raise PvgisError(f"PVGIS HTTP {exc.code}: {self._error_message(body)}") from exc
-            except URLError as exc:
-                if last:
-                    raise PvgisError(f"PVGIS unreachable: {exc.reason}") from exc
-            time.sleep(2**attempt)
-        raise AssertionError("unreachable")
+        Both lists must be increasing, because C++ takes values between neighbouring entries.
+        A flat surface (slope 0) gets the same sun from every direction, so it is asked for only once.
+        """
+        self._check_increasing("slopes", slopes)
+        self._check_increasing("azimuths", azimuths)
+        lat, lon = area.center_lat_lon()
+        irradiation: list[list[float]] = []
+        yield_per_kwp: list[list[float]] = []
+        for slope in slopes:
+            if slope == 0:
+                flat_result = self._ask_pvgis(lat, lon, slope=0, aspect=0)
+                row = [flat_result] * len(azimuths)
+            else:
+                row = [self._ask_pvgis(lat, lon, slope, self.compass_to_pvgis_aspect(a)) for a in azimuths]
+            irradiation.append([sunlight for sunlight, _ in row])
+            yield_per_kwp.append([energy for _, energy in row])
+        return PvgisTable(lat, lon, list(slopes), list(azimuths), irradiation, yield_per_kwp)
 
     @staticmethod
-    def _error_message(body: str) -> str:
+    def compass_to_pvgis_aspect(azimuth: float) -> float:
+        """Convert a compass direction (0 = north, 90 = east) to the PVGIS one (0 = south, -90 = east, 90 = west)."""
+        aspect = (azimuth - 180) % 360
+        return aspect - 360 if aspect >= 180 else aspect
+
+    def _ask_pvgis(self, lat: float, lon: float, slope: float, aspect: float) -> tuple[float, float]:
+        """Ask PVGIS about one surface; return (yearly sunlight in kWh/m², yearly energy of 1 kWp in kWh).
+
+        System losses (cables, inverter etc.) are set to 14%, the PVGIS default; the design doc does not set them.
+        """
+        query = {
+            "lat": lat,
+            "lon": lon,
+            "peakpower": 1,
+            "loss": self.SYSTEM_LOSS_PERCENT,
+            "angle": slope,
+            "aspect": aspect,
+            "outputformat": "json",
+        }
+        answer = self._download_json(f"{self.URL}?{urlencode(query)}")
+        try:
+            yearly = answer["outputs"]["totals"]["fixed"]
+            return round(float(yearly["H(i)_y"]), 1), round(float(yearly["E_y"]), 1)
+        except (KeyError, TypeError, ValueError) as error:
+            raise PvgisError(f"unexpected PVGIS answer for slope={slope}, aspect={aspect}") from error
+
+    def _download_json(self, url: str) -> dict:
+        """Download `url` and return its JSON content; on failure raise PvgisError with the PVGIS message."""
+        request = Request(url, headers={"User-Agent": "pvcompute/0.1"})
+        try:
+            with urlopen(request, timeout=self.TIMEOUT_SECONDS) as response:
+                return json.load(response)
+        except HTTPError as error:
+            raise PvgisError(f"PVGIS error {error.code}: {self._error_message(error)}") from error
+        except URLError as error:
+            raise PvgisError(f"PVGIS cannot be reached: {error.reason}") from error
+
+    @staticmethod
+    def _error_message(error: HTTPError) -> str:
+        """Return the explanation PVGIS sends with an error (e.g. "Location over the sea")."""
+        body = error.read().decode("utf-8", "replace")
         try:
             return json.loads(body)["message"]
         except (ValueError, KeyError, TypeError):
             return body[:300]
 
-
-class PvgisReader:
-    """Fetches the PVGIS table from the PVcalc service."""
-
-    URL = "https://re.jrc.ec.europa.eu/api/v5_3/PVcalc"
-    LOSS = 14.0
-    """System losses in %, the PVGIS default (the design doc does not set it)."""
-
-    def __init__(self, http: PvgisHttpClient | None = None):
-        self.http = http or PvgisHttpClient()
-
-    def read(self, area: BoundingBox, axes: PvgisAxes) -> PvgisTable:
-        """Table for the center of `area` (EPSG:2180)."""
-        lat, lon = area.center_wgs84()
-        log.info("fetching PVGIS table for lat=%s lon=%s (%d requests)", lat, lon, axes.request_count)
-        width = len(axes.azimuths)
-        irradiation: list[list[float]] = []
-        yield_: list[list[float]] = []
-        for slope in axes.slopes:
-            if slope == 0:
-                h, e = self._query(lat, lon, 0, 0)
-                row_h, row_e = [h] * width, [e] * width
-            else:
-                values = [self._query(lat, lon, slope, self.azimuth_to_aspect(a)) for a in axes.azimuths]
-                row_h, row_e = [v[0] for v in values], [v[1] for v in values]
-            irradiation.append(row_h)
-            yield_.append(row_e)
-        return PvgisTable(lat, lon, axes, irradiation, yield_)
-
     @staticmethod
-    def azimuth_to_aspect(azimuth: float) -> float:
-        """Compass azimuth (0 = N, clockwise) to PVGIS aspect (0 = S, -90 = E, 90 = W)."""
-        aspect = (azimuth - 180) % 360
-        return aspect - 360 if aspect >= 180 else aspect
-
-    def _query(self, lat: float, lon: float, slope: float, aspect: float) -> tuple[float, float]:
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "peakpower": 1,
-            "loss": self.LOSS,
-            "angle": slope,
-            "aspect": aspect,
-            "outputformat": "json",
-        }
-        data = self.http.get(f"{self.URL}?{urlencode(params)}")
-        try:
-            fixed = data["outputs"]["totals"]["fixed"]
-            return round(float(fixed["H(i)_y"]), 1), round(float(fixed["E_y"]), 1)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PvgisError(f"unexpected PVGIS response for slope={slope}, aspect={aspect}") from exc
+    def _check_increasing(name: str, values: list[float]) -> None:
+        """Raise ValueError when `values` is empty or not strictly increasing."""
+        if not values or any(next_value <= value for value, next_value in zip(values, values[1:])):
+            raise ValueError(f"{name} must be a non-empty, increasing list: {values}")

@@ -21,37 +21,53 @@ from pathlib import Path
 
 import numpy as np
 
-from pvcompute.data_models import BuildingPoints, Footprint, PvgisTable
+from pvcompute.data_models import BuildingPoints, PvgisTable
 
 
 class InputJsonWriter:
+    """Writes the PVGIS table and the buildings with their points to input.json."""
+
     DECIMALS = 2
 
     def __init__(self, path: str | Path):
+        """Set where input.json will be written."""
         self.path = Path(path)
 
-    def write(self, table: PvgisTable, buildings: Iterable[BuildingPoints]) -> None:
-        document = {
-            "pvgis": table.to_dict(),
-            "buildings": [self._building_entry(b) for b in buildings],
+    def write(self, pvgis_table: PvgisTable, buildings: Iterable[BuildingPoints]) -> None:
+        """Write the file (missing folders are created, an existing file is replaced)."""
+        content = {
+            "pvgis": self._pvgis_entry(pvgis_table),
+            "buildings": [self._building_entry(building) for building in buildings],
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(document, f)
+        with open(self.path, "w", encoding="utf-8") as file:
+            json.dump(content, file)
 
-    def _building_entry(self, building: BuildingPoints) -> dict:
+    @staticmethod
+    def _pvgis_entry(table: PvgisTable) -> dict:
+        """Return the `pvgis` object of input.json."""
         return {
-            "id": building.id,
-            "footprint": self._footprint_coords(building.footprint),
-            "ground_points": self._points(building.ground_points),
-            "roof_points": self._points(building.roof_points),
+            "lat": table.lat,
+            "lon": table.lon,
+            "slopes": table.slopes,
+            "azimuths": table.azimuths,
+            "irradiation": table.irradiation,
+            "yield": table.yield_per_kwp,
         }
 
-    def _footprint_coords(self, footprint: Footprint) -> list[list[float]]:
-        coords = np.round(np.asarray(footprint.polygon.exterior.coords)[:-1], self.DECIMALS)
-        # Rounding can merge neighbouring corners; drop the repeats (cyclically).
-        distinct = np.any(coords != np.roll(coords, 1, axis=0), axis=1)
-        return coords[distinct].tolist()
+    def _building_entry(self, building: BuildingPoints) -> dict:
+        """Return one entry of the `buildings` list of input.json.
 
-    def _points(self, points: np.ndarray) -> list[list[float]]:
-        return np.round(points, self.DECIMALS).tolist()
+        Shapely repeats the first corner of an outline at the end; input.json does not, so it is cut off.
+        """
+        outline_corners = building.footprint.polygon.exterior.coords[:-1]
+        return {
+            "id": building.footprint.building_id,
+            "footprint": self._rounded(outline_corners),
+            "ground_points": self._rounded(building.ground_points),
+            "roof_points": self._rounded(building.roof_points),
+        }
+
+    def _rounded(self, coordinates) -> list[list[float]]:
+        """Return the coordinates as lists of numbers rounded to centimetres."""
+        return np.round(np.asarray(coordinates, dtype=float), self.DECIMALS).tolist()
