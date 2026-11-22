@@ -9,7 +9,6 @@ Design doc: 2.1, block "Wczytanie obrysów"; 2.4 (GeoPandas reads BDOT10k and co
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import geopandas as gpd
@@ -22,25 +21,18 @@ from shapely.geometry.polygon import orient
 from pvcompute.area import PROJECT_CRS, Area
 from pvcompute.data_models import Footprint
 
-log = logging.getLogger(__name__)
-
 
 class Bdot10kReader:
     """Reads the building outlines of one area from a BDOT10k file."""
 
     BUILDING_LAYER_MARK = "BUBD"
 
-    def __init__(self, path: str | Path, layer: str | None = None, id_column: str | None = None):
-        """Open a BDOT10k file.
-
-        `layer` and `id_column` are found automatically; pass them only when that fails
-        (a file with several building layers, an unusual name of the ID column).
-        """
+    def __init__(self, path: str | Path):
+        """Open a BDOT10k file and find its building layer."""
         self.path = Path(path)
         if not self.path.is_file():
             raise FileNotFoundError(f"BDOT10k file not found: {self.path}")
-        self.layer = layer or self._find_building_layer()
-        self.id_column = id_column
+        self.layer = self._find_building_layer()
 
     def read(self, area: Area) -> list[Footprint]:
         """Return the outlines of all buildings that belong to `area`.
@@ -48,16 +40,14 @@ class Bdot10kReader:
         A building belongs to the area when a point inside its outline lies in the area.
         So a building on the edge between two areas goes to exactly one of them.
         The file may use another coordinate system; GeoPandas converts the area to it
-        for reading and the outlines back to EPSG:2180.
+        for reading and the outlines back to EPSG:2180. A building ID that appears twice is taken once.
         """
         area_shape = gpd.GeoSeries([area.to_polygon()], crs=PROJECT_CRS)
         buildings = gpd.read_file(self.path, layer=self.layer, bbox=area_shape)
-        if buildings.crs is None:
-            raise ValueError(f"{self.path}: the file does not say which coordinate system it uses")
         if buildings.empty:
             return []
         buildings = buildings.to_crs(PROJECT_CRS)
-        id_column = self.id_column or self._find_id_column(list(buildings.columns))
+        id_column = self._find_id_column(list(buildings.columns))
 
         area_polygon = area.to_polygon()
         footprints: list[Footprint] = []
@@ -67,13 +57,9 @@ class Bdot10kReader:
                 continue
             building_id = str(raw_id).strip()
             polygon = self._to_single_polygon(geometry)
-            if polygon is None:
-                log.warning("building %s has no area, skipped", building_id)
+            if polygon is None or building_id in used_ids:
                 continue
             if not area_polygon.contains(polygon.representative_point()):
-                continue
-            if building_id in used_ids:
-                log.warning("building ID %s appears twice, keeping the first one", building_id)
                 continue
             used_ids.add(building_id)
             footprints.append(Footprint(building_id, polygon))
@@ -86,16 +72,16 @@ class Bdot10kReader:
             return None
         building_layers = [name for name in layer_names if self.BUILDING_LAYER_MARK in name.upper()]
         if len(building_layers) != 1:
-            raise ValueError(f"{self.path}: cannot tell which layer holds buildings: {layer_names}; pass `layer`")
+            raise ValueError(f"{self.path}: cannot tell which layer holds buildings: {layer_names}")
         return building_layers[0]
 
     @staticmethod
     def _find_id_column(column_names: list[str]) -> str:
-        """Return the column with the BDOT10k ID (`lokalnyId`; exports spell it e.g. `LOKALNYID`, `lokalny_id`)."""
+        """Return the column with the BDOT10k ID (`lokalnyId`; GeoPackage files spell it `LOKALNYID`)."""
         for name in column_names:
             if name.lower().replace("_", "").endswith("lokalnyid"):
                 return name
-        raise ValueError(f"no BDOT10k ID column (lokalnyId) among {column_names}; pass `id_column`")
+        raise ValueError(f"no BDOT10k ID column (lokalnyId) among {column_names}")
 
     @classmethod
     def _to_single_polygon(cls, geometry: BaseGeometry) -> Polygon | None:

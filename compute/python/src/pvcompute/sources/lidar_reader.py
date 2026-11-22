@@ -1,15 +1,15 @@
 """Reads LiDAR points (a laser scan of the terrain) from LAS/LAZ files.
 
 From the scan it keeps only the points marked as ground (class 2) and as building (class 6)
-that lie in the chosen area, and returns them as a PointCloud. The files must already be in
-EPSG:2180, like the LiDAR data published for Poland; heights stay in metres above sea level.
+that lie in the chosen area, and gives them out part by part as PointCloud objects. The files must
+already be in EPSG:2180, like the LiDAR data published for Poland; heights stay in metres above sea level.
 
 Design doc: 2.1, block "Wczytanie chmury punktów"; 2.4 (laspy reads LAZ files).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import laspy
@@ -31,28 +31,33 @@ class LidarReader:
         """Take LAS/LAZ files, or folders with such files, to read from."""
         self.files = self._find_lidar_files(paths)
 
-    def read(self, area: Area) -> PointCloud:
-        """Return the ground and building points that lie in `area`.
+    def read(self, area: Area) -> Iterator[PointCloud]:
+        """Give out the ground and building points that lie in `area`, one part of a file at a time.
 
-        Pass the chosen area grown by the ground ring width, so buildings at the edge
-        of the area also get the ground points around them. Files that lie outside the area
-        are skipped, and big files are read in parts so they do not have to fit into memory.
+        All points of a district do not fit into memory at once (hundreds of millions), so they come
+        in parts of POINTS_PER_CHUNK file points and the caller keeps only what it needs.
+        Pass the chosen area grown by the ground ring width, so buildings at the edge of the area
+        also get the ground points around them. Files that lie outside the area are skipped.
         """
-        ground_parts: list[np.ndarray] = []
-        building_parts: list[np.ndarray] = []
         for path in self.files:
+            if not self._file_area(path).overlaps(area):
+                continue
             with laspy.open(path) as lidar_file:
-                header = lidar_file.header
-                file_area = Area(header.mins[0], header.mins[1], header.maxs[0], header.maxs[1])
-                if not file_area.overlaps(area):
-                    continue
                 for chunk in lidar_file.chunk_iterator(self.POINTS_PER_CHUNK):
                     points = np.column_stack((np.asarray(chunk.x), np.asarray(chunk.y), np.asarray(chunk.z)))
                     point_classes = np.asarray(chunk.classification)
                     in_area = area.contains_points(points)
-                    ground_parts.append(points[in_area & (point_classes == self.GROUND_CLASS)])
-                    building_parts.append(points[in_area & (point_classes == self.BUILDING_CLASS)])
-        return PointCloud(self._join(ground_parts), self._join(building_parts))
+                    yield PointCloud(
+                        ground_points=points[in_area & (point_classes == self.GROUND_CLASS)],
+                        building_points=points[in_area & (point_classes == self.BUILDING_CLASS)],
+                    )
+
+    @staticmethod
+    def _file_area(path: Path) -> Area:
+        """Return the rectangle covered by a LiDAR file, read from its header (without reading the points)."""
+        with laspy.open(path) as lidar_file:
+            header = lidar_file.header
+            return Area(header.mins[0], header.mins[1], header.maxs[0], header.maxs[1])
 
     @classmethod
     def _find_lidar_files(cls, paths: Iterable[str | Path]) -> list[Path]:
@@ -68,8 +73,3 @@ class LidarReader:
         if not files:
             raise FileNotFoundError("no LAS/LAZ files found in the given paths")
         return files
-
-    @staticmethod
-    def _join(parts: list[np.ndarray]) -> np.ndarray:
-        """Join the point arrays from all chunks into one array (an empty one when there are no points)."""
-        return np.concatenate(parts) if parts else np.empty((0, 3))

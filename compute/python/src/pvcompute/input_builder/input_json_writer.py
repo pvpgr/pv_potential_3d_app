@@ -34,14 +34,21 @@ class InputJsonWriter:
         self.path = Path(path)
 
     def write(self, pvgis_table: PvgisTable, buildings: Iterable[BuildingPoints]) -> None:
-        """Write the file (missing folders are created, an existing file is replaced)."""
-        content = {
-            "pvgis": self._pvgis_entry(pvgis_table),
-            "buildings": [self._building_entry(building) for building in buildings],
-        }
+        """Write the file (missing folders are created, an existing file is replaced).
+
+        The file is written building by building, because for a whole district it has
+        hundreds of MB and building it in memory at once would need several times more.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as file:
-            json.dump(content, file)
+            file.write('{"pvgis": ')
+            json.dump(self._pvgis_entry(pvgis_table), file)
+            file.write(', "buildings": [')
+            for number, building in enumerate(buildings):
+                if number > 0:
+                    file.write(", ")
+                json.dump(self._building_entry(building), file)
+            file.write("]}")
 
     @staticmethod
     def _pvgis_entry(table: PvgisTable) -> dict:

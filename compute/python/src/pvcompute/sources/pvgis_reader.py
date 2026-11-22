@@ -15,7 +15,8 @@ Design doc: 2.1, block "Pobranie danych PVGIS"; 2.4 "Dane z PVGIS".
 from __future__ import annotations
 
 import json
-from urllib.error import HTTPError, URLError
+import time
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -28,32 +29,39 @@ class PvgisError(RuntimeError):
 
 
 class PvgisReader:
-    """Downloads the PVGIS sunlight table for the center of an area."""
+    """Downloads the PVGIS sunlight table for the center of an area.
+
+    The design doc does not say for which slopes and azimuths the table is made (its example uses
+    slopes 0, 30, 40 and azimuths 0, 90, 180, 270). Here: every 10° of slope and every 30° of azimuth,
+    1 + 9 x 12 = 109 questions to PVGIS. Both lists are increasing, because C++ takes values
+    between neighbouring entries.
+    """
 
     URL = "https://re.jrc.ec.europa.eu/api/v5_3/PVcalc"
+    SLOPES = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
+    AZIMUTHS = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330]
     SYSTEM_LOSS_PERCENT = 14.0
     TIMEOUT_SECONDS = 60
+    ATTEMPTS = 4
+    RETRY_WAIT_SECONDS = 3
+    RETRY_HTTP_CODES = (429, 500, 502, 503, 504, 529)
 
-    def read(self, area: Area, slopes: list[float], azimuths: list[float]) -> PvgisTable:
-        """Download the table for the center of `area`: one value per slope and compass azimuth.
+    def read(self, area: Area) -> PvgisTable:
+        """Download the table for the center of `area`: one value per slope (row) and compass azimuth (column).
 
-        Both lists must be increasing, because C++ takes values between neighbouring entries.
         A flat surface (slope 0) gets the same sun from every direction, so it is asked for only once.
         """
-        self._check_increasing("slopes", slopes)
-        self._check_increasing("azimuths", azimuths)
         lat, lon = area.center_lat_lon()
         irradiation: list[list[float]] = []
         yield_per_kwp: list[list[float]] = []
-        for slope in slopes:
+        for slope in self.SLOPES:
             if slope == 0:
-                flat_result = self._ask_pvgis(lat, lon, slope=0, aspect=0)
-                row = [flat_result] * len(azimuths)
+                row = [self._ask_pvgis(lat, lon, slope=0, aspect=0)] * len(self.AZIMUTHS)
             else:
-                row = [self._ask_pvgis(lat, lon, slope, self.compass_to_pvgis_aspect(a)) for a in azimuths]
+                row = [self._ask_pvgis(lat, lon, slope, self.compass_to_pvgis_aspect(a)) for a in self.AZIMUTHS]
             irradiation.append([sunlight for sunlight, _ in row])
             yield_per_kwp.append([energy for _, energy in row])
-        return PvgisTable(lat, lon, list(slopes), list(azimuths), irradiation, yield_per_kwp)
+        return PvgisTable(lat, lon, list(self.SLOPES), list(self.AZIMUTHS), irradiation, yield_per_kwp)
 
     @staticmethod
     def compass_to_pvgis_aspect(azimuth: float) -> float:
@@ -83,27 +91,22 @@ class PvgisReader:
             raise PvgisError(f"unexpected PVGIS answer for slope={slope}, aspect={aspect}") from error
 
     def _download_json(self, url: str) -> dict:
-        """Download `url` and return its JSON content; on failure raise PvgisError with the PVGIS message."""
+        """Download `url` and return its JSON content; on failure raise PvgisError with the reason.
+
+        PVGIS sometimes drops a connection or answers "busy" (HTTP 429, 5xx), so such a question
+        is asked again, up to ATTEMPTS times, waiting a bit longer each time. Other errors,
+        e.g. "Location over the sea", stop at once with the answer from PVGIS.
+        """
         request = Request(url, headers={"User-Agent": "pvcompute/0.1"})
-        try:
-            with urlopen(request, timeout=self.TIMEOUT_SECONDS) as response:
-                return json.load(response)
-        except HTTPError as error:
-            raise PvgisError(f"PVGIS error {error.code}: {self._error_message(error)}") from error
-        except URLError as error:
-            raise PvgisError(f"PVGIS cannot be reached: {error.reason}") from error
-
-    @staticmethod
-    def _error_message(error: HTTPError) -> str:
-        """Return the explanation PVGIS sends with an error (e.g. "Location over the sea")."""
-        body = error.read().decode("utf-8", "replace")
-        try:
-            return json.loads(body)["message"]
-        except (ValueError, KeyError, TypeError):
-            return body[:300]
-
-    @staticmethod
-    def _check_increasing(name: str, values: list[float]) -> None:
-        """Raise ValueError when `values` is empty or not strictly increasing."""
-        if not values or any(next_value <= value for value, next_value in zip(values, values[1:])):
-            raise ValueError(f"{name} must be a non-empty, increasing list: {values}")
+        for attempt in range(1, self.ATTEMPTS + 1):
+            try:
+                with urlopen(request, timeout=self.TIMEOUT_SECONDS) as response:
+                    return json.load(response)
+            except HTTPError as error:
+                if error.code not in self.RETRY_HTTP_CODES or attempt == self.ATTEMPTS:
+                    raise PvgisError(f"PVGIS error {error.code}: {error.read().decode('utf-8', 'replace')}") from error
+            except OSError as error:
+                if attempt == self.ATTEMPTS:
+                    raise PvgisError(f"PVGIS cannot be reached: {error}") from error
+            time.sleep(self.RETRY_WAIT_SECONDS * attempt)
+        raise PvgisError("PVGIS: no answer")

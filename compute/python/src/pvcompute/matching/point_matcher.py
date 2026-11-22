@@ -20,40 +20,61 @@ from pvcompute.data_models import BuildingPoints, Footprint, PointCloud
 
 
 class PointMatcher:
-    """Assigns ground and roof points to every building outline."""
+    """Assigns ground and roof points to every building outline.
 
-    DEFAULT_GROUND_RING_WIDTH = 3.0
+    Ground points are taken from a ring GROUND_RING_WIDTH metres wide around the outline;
+    the design doc only says "a ring around the building", 3 m was chosen.
+    """
 
-    def __init__(self, ground_ring_width: float = DEFAULT_GROUND_RING_WIDTH):
-        """Set the width (metres) of the ring around a building where ground points are taken.
+    GROUND_RING_WIDTH = 3.0
 
-        The design doc only says "a ring around the building"; 3 m is the default.
-        """
-        if ground_ring_width <= 0:
-            raise ValueError("ground ring width must be positive")
-        self.ground_ring_width = ground_ring_width
-
-    def match(self, footprints: Iterable[Footprint], point_cloud: PointCloud) -> list[BuildingPoints]:
+    def match(self, footprints: Iterable[Footprint], point_cloud_parts: Iterable[PointCloud]) -> list[BuildingPoints]:
         """Return every building together with its ground points and roof points.
 
-        The outlines are "prepared" first, which makes the many "is this point inside?" tests faster.
+        The LiDAR points come in parts (see LidarReader.read). From every part each building takes
+        the points that belong to it and the rest is dropped, so only the needed points stay in memory.
+        A part is checked only against the buildings that lie near it. The outlines are "prepared"
+        first, which makes the many "is this point inside?" tests faster.
         """
-        ground_points = PointsSortedByX(point_cloud.ground_points)
-        building_points = PointsSortedByX(point_cloud.building_points)
-        buildings = []
-        for footprint in footprints:
-            outline = footprint.polygon
-            outline_with_ring = outline.buffer(self.ground_ring_width)
-            shapely.prepare(outline)
-            shapely.prepare(outline_with_ring)
-            buildings.append(
-                BuildingPoints(
-                    footprint=footprint,
-                    ground_points=ground_points.inside(outline_with_ring, excluding=outline),
-                    roof_points=building_points.inside(outline),
-                )
-            )
-        return buildings
+        footprints = list(footprints)
+        outlines = [footprint.polygon for footprint in footprints]
+        outlines_with_ring = [outline.buffer(self.GROUND_RING_WIDTH) for outline in outlines]
+        shapely.prepare(outlines)
+        shapely.prepare(outlines_with_ring)
+        ring_bounds = np.array([shape.bounds for shape in outlines_with_ring]).reshape(-1, 4)
+        ground_found: list[list[np.ndarray]] = [[] for _ in footprints]
+        roof_found: list[list[np.ndarray]] = [[] for _ in footprints]
+        for part in point_cloud_parts:
+            ground_points = PointsSortedByX(part.ground_points)
+            building_points = PointsSortedByX(part.building_points)
+            for index in self._buildings_near(ring_bounds, part):
+                ground_found[index].append(ground_points.inside(outlines_with_ring[index], excluding=outlines[index]))
+                roof_found[index].append(building_points.inside(outlines[index]))
+        return [
+            BuildingPoints(footprint, self._join(ground), self._join(roof))
+            for footprint, ground, roof in zip(footprints, ground_found, roof_found)
+        ]
+
+    @staticmethod
+    def _buildings_near(ring_bounds: np.ndarray, part: PointCloud) -> np.ndarray:
+        """Return the numbers of the buildings whose outline with ring overlaps the rectangle covered by `part`."""
+        points = np.concatenate((part.ground_points, part.building_points))
+        if len(points) == 0:
+            return np.empty(0, dtype=int)
+        min_x, min_y = points[:, 0].min(), points[:, 1].min()
+        max_x, max_y = points[:, 0].max(), points[:, 1].max()
+        overlaps = (
+            (ring_bounds[:, 0] <= max_x)
+            & (ring_bounds[:, 2] >= min_x)
+            & (ring_bounds[:, 1] <= max_y)
+            & (ring_bounds[:, 3] >= min_y)
+        )
+        return np.flatnonzero(overlaps)
+
+    @staticmethod
+    def _join(parts: list[np.ndarray]) -> np.ndarray:
+        """Join the points found in all parts into one array (an empty one when nothing was found)."""
+        return np.concatenate(parts) if parts else np.empty((0, 3))
 
 
 class PointsSortedByX:
