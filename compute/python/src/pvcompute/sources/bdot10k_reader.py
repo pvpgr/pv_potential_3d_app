@@ -2,81 +2,106 @@
 
 BDOT10k is the official Polish topographic database. This file opens its building layer (OT_BUBD_A),
 keeps only the buildings in the chosen area and returns each one as a Footprint: the building ID
-and its outline seen from above. Works with GML, GeoPackage and Shapefile files.
+(`lokalnyId`) and its outline seen from above. Works with GML, GeoPackage and Shapefile files.
 
-Design doc: 2.1, block "Wczytanie obrysów".
+Design doc: 2.1, block "Wczytanie obrysów"; 2.4 (GeoPandas reads BDOT10k and converts coordinates).
 """
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
+import shapely
+from shapely.geometry import Polygon
+from shapely.geometry.base import BaseGeometry
+from shapely.geometry.polygon import orient
 
-from pvcompute.coordinates import TARGET_CRS, BoundingBox
+from pvcompute.area import PROJECT_CRS, Area
 from pvcompute.data_models import Footprint
-
-log = logging.getLogger(__name__)
 
 
 class Bdot10kReader:
-    BUILDING_LAYER_HINT = "BUBD"
+    """Reads the building outlines of one area from a BDOT10k file."""
 
-    def __init__(self, path: str | Path, layer: str | None = None, id_field: str | None = None):
-        """`layer` and `id_field` are needed only when they cannot be detected (several layers, unusual column name)."""
+    BUILDING_LAYER_MARK = "BUBD"
+
+    def __init__(self, path: str | Path):
+        """Open a BDOT10k file and find its building layer."""
         self.path = Path(path)
         if not self.path.is_file():
             raise FileNotFoundError(f"BDOT10k file not found: {self.path}")
-        self.layer = layer or self._find_building_layer()
-        self.id_field = id_field
+        self.layer = self._find_building_layer()
 
-    def read(self, area: BoundingBox) -> list[Footprint]:
-        """Footprints of the buildings belonging to `area` (EPSG:2180).
+    def read(self, area: Area) -> list[Footprint]:
+        """Return the outlines of all buildings that belong to `area`.
 
-        A building belongs to the area when an interior point of its footprint lies inside it,
-        so adjacent areas never share a building.
+        A building belongs to the area when a point inside its outline lies in the area.
+        So a building on the edge between two areas goes to exactly one of them.
+        The file may use another coordinate system; GeoPandas converts the area to it
+        for reading and the outlines back to EPSG:2180. A building ID that appears twice is taken once.
         """
-        # GeoPandas converts a bbox given as a GeoSeries to the layer's own CRS.
-        bbox = gpd.GeoSeries([area.to_polygon()], crs=TARGET_CRS)
-        gdf = gpd.read_file(self.path, layer=self.layer, bbox=bbox)
-        if gdf.crs is None:
-            raise ValueError(f"{self.path}: layer has no coordinate reference system")
-        if gdf.empty:
+        area_shape = gpd.GeoSeries([area.to_polygon()], crs=PROJECT_CRS)
+        buildings = gpd.read_file(self.path, layer=self.layer, bbox=area_shape)
+        if buildings.empty:
             return []
-        gdf = gdf.to_crs(TARGET_CRS)
-        id_field = self.id_field or self._detect_id_field(list(gdf.columns))
+        buildings = buildings.to_crs(PROJECT_CRS)
+        id_column = self._find_id_column(list(buildings.columns))
 
         area_polygon = area.to_polygon()
         footprints: list[Footprint] = []
-        seen: set[str] = set()
-        for raw_id, geometry in zip(gdf[id_field], gdf.geometry):
-            building_id = "" if raw_id is None else str(raw_id).strip()
-            if geometry is None or geometry.is_empty or building_id in ("", "nan"):
+        used_ids: set[str] = set()
+        for raw_id, geometry in zip(buildings[id_column], buildings.geometry):
+            if pd.isna(raw_id) or geometry is None:
                 continue
-            footprint = Footprint.from_geometry(building_id, geometry)
-            if footprint is None or not area_polygon.contains(footprint.polygon.representative_point()):
+            building_id = str(raw_id).strip()
+            polygon = self._to_single_polygon(geometry)
+            if polygon is None or building_id in used_ids:
                 continue
-            if building_id in seen:
-                log.warning("duplicate building id %s, keeping the first one", building_id)
+            if not area_polygon.contains(polygon.representative_point()):
                 continue
-            seen.add(building_id)
-            footprints.append(footprint)
+            used_ids.add(building_id)
+            footprints.append(Footprint(building_id, polygon))
         return footprints
 
     def _find_building_layer(self) -> str | None:
-        layers = [str(name) for name in gpd.list_layers(self.path)["name"]]
-        if len(layers) <= 1:
+        """Return the name of the building layer (the one with "BUBD" in its name); None when the file has one layer."""
+        layer_names = [str(name) for name in gpd.list_layers(self.path)["name"]]
+        if len(layer_names) <= 1:
             return None
-        matches = [name for name in layers if self.BUILDING_LAYER_HINT in name.upper()]
-        if len(matches) == 1:
-            return matches[0]
-        raise ValueError(f"{self.path}: cannot choose the building layer from {layers}; pass it explicitly")
+        building_layers = [name for name in layer_names if self.BUILDING_LAYER_MARK in name.upper()]
+        if len(building_layers) != 1:
+            raise ValueError(f"{self.path}: cannot tell which layer holds buildings: {layer_names}")
+        return building_layers[0]
 
     @staticmethod
-    def _detect_id_field(columns: list[str]) -> str:
-        """BDOT10k identifies objects by `lokalnyId`; GML/SHP exports spell it differently."""
-        candidates = [c for c in columns if c.lower().replace("_", "").endswith("lokalnyid")]
-        if not candidates:
-            raise ValueError(f"no BDOT10k id column (lokalnyId) among {columns}; pass it explicitly")
-        return candidates[0]
+    def _find_id_column(column_names: list[str]) -> str:
+        """Return the column with the BDOT10k ID (`lokalnyId`; GeoPackage files spell it `LOKALNYID`)."""
+        for name in column_names:
+            if name.lower().replace("_", "").endswith("lokalnyid"):
+                return name
+        raise ValueError(f"no BDOT10k ID column (lokalnyId) among {column_names}")
+
+    @classmethod
+    def _to_single_polygon(cls, geometry: BaseGeometry) -> Polygon | None:
+        """Turn a raw BDOT10k outline into one simple polygon; None when it has no area.
+
+        input.json describes an outline as one list of corners, so: heights are removed,
+        broken shapes are repaired, from an outline made of several parts the largest part is kept,
+        holes are dropped, and the corners go counter-clockwise (as in the design doc example).
+        """
+        geometry = shapely.make_valid(shapely.force_2d(geometry))
+        polygons = cls._polygons_in(geometry)
+        if not polygons:
+            return None
+        largest = max(polygons, key=lambda polygon: polygon.area)
+        return orient(Polygon(largest.exterior), sign=1.0)
+
+    @classmethod
+    def _polygons_in(cls, geometry: BaseGeometry) -> list[Polygon]:
+        """Return all polygons with a non-zero area found in `geometry`, also inside collections of shapes."""
+        if isinstance(geometry, Polygon):
+            return [geometry] if geometry.area > 0 else []
+        parts = getattr(geometry, "geoms", [])
+        return [polygon for part in parts for polygon in cls._polygons_in(part)]

@@ -20,51 +20,79 @@ from pvcompute.data_models import BuildingPoints, Footprint, PointCloud
 
 
 class PointMatcher:
+    """Assigns ground and roof points to every building outline.
+
+    Ground points are taken from a ring GROUND_RING_WIDTH metres wide around the outline;
+    the design doc only says "a ring around the building", 3 m was chosen.
+    """
+
     GROUND_RING_WIDTH = 3.0
-    """Metres; the design doc only says "a ring around the building"."""
 
-    def __init__(self, ground_ring_width: float = GROUND_RING_WIDTH):
-        if ground_ring_width <= 0:
-            raise ValueError("ground ring width must be positive")
-        self.ground_ring_width = ground_ring_width
+    def match(self, footprints: Iterable[Footprint], point_cloud_parts: Iterable[PointCloud]) -> list[BuildingPoints]:
+        """Return every building together with its ground points and roof points.
 
-    def match(self, footprints: Iterable[Footprint], cloud: PointCloud) -> list[BuildingPoints]:
-        ground = SortedPointIndex(cloud.ground)
-        roof = SortedPointIndex(cloud.building)
-        result = []
-        for footprint in footprints:
-            polygon = footprint.polygon
-            surroundings = polygon.buffer(self.ground_ring_width)
-            shapely.prepare(polygon)
-            shapely.prepare(surroundings)
-            result.append(
-                BuildingPoints(
-                    footprint=footprint,
-                    ground_points=ground.within(surroundings, exclude=polygon),
-                    roof_points=roof.within(polygon),
-                )
-            )
-        return result
+        The LiDAR points come in parts (see LidarReader.read). From every part each building takes
+        the points that belong to it and the rest is dropped, so only the needed points stay in memory.
+        A part is checked only against the buildings that lie near it. The outlines are "prepared"
+        first, which makes the many "is this point inside?" tests faster.
+        """
+        footprints = list(footprints)
+        outlines = [footprint.polygon for footprint in footprints]
+        outlines_with_ring = [outline.buffer(self.GROUND_RING_WIDTH) for outline in outlines]
+        shapely.prepare(outlines)
+        shapely.prepare(outlines_with_ring)
+        ring_bounds = np.array([shape.bounds for shape in outlines_with_ring]).reshape(-1, 4)
+        ground_found: list[list[np.ndarray]] = [[] for _ in footprints]
+        roof_found: list[list[np.ndarray]] = [[] for _ in footprints]
+        for part in point_cloud_parts:
+            ground_points = PointsSortedByX(part.ground_points)
+            building_points = PointsSortedByX(part.building_points)
+            for index in self._buildings_near(ring_bounds, part):
+                ground_found[index].append(ground_points.inside(outlines_with_ring[index], excluding=outlines[index]))
+                roof_found[index].append(building_points.inside(outlines[index]))
+        return [
+            BuildingPoints(footprint, self._join(ground), self._join(roof))
+            for footprint, ground, roof in zip(footprints, ground_found, roof_found)
+        ]
+
+    @staticmethod
+    def _buildings_near(ring_bounds: np.ndarray, part: PointCloud) -> np.ndarray:
+        """Return the numbers of the buildings whose outline with ring overlaps the rectangle covered by `part`."""
+        points = np.concatenate((part.ground_points, part.building_points))
+        if len(points) == 0:
+            return np.empty(0, dtype=int)
+        min_x, min_y = points[:, 0].min(), points[:, 1].min()
+        max_x, max_y = points[:, 0].max(), points[:, 1].max()
+        overlaps = (
+            (ring_bounds[:, 0] <= max_x)
+            & (ring_bounds[:, 2] >= min_x)
+            & (ring_bounds[:, 1] <= max_y)
+            & (ring_bounds[:, 3] >= min_y)
+        )
+        return np.flatnonzero(overlaps)
+
+    @staticmethod
+    def _join(parts: list[np.ndarray]) -> np.ndarray:
+        """Join the points found in all parts into one array (an empty one when nothing was found)."""
+        return np.concatenate(parts) if parts else np.empty((0, 3))
 
 
-class SortedPointIndex:
-    """Points sorted by x, so a query only tests the points in the geometry's x-range."""
+class PointsSortedByX:
+    """Points kept sorted by x, so finding the points inside a shape checks only the points near it."""
 
     def __init__(self, points: np.ndarray):
+        """Sort the points (one row per point: x, y, z) by x."""
         self.points = points[np.argsort(points[:, 0], kind="stable")]
-        self._x = self.points[:, 0]
 
-    def within(self, geometry: BaseGeometry, exclude: BaseGeometry | None = None) -> np.ndarray:
-        """Points inside `geometry` (boundary included) and outside `exclude`."""
-        min_x, min_y, max_x, max_y = geometry.bounds
-        lo = np.searchsorted(self._x, min_x, side="left")
-        hi = np.searchsorted(self._x, max_x, side="right")
-        candidates = self.points[lo:hi]
-        candidates = candidates[(candidates[:, 1] >= min_y) & (candidates[:, 1] <= max_y)]
-        if not len(candidates):
-            return candidates
-        x, y = candidates[:, 0], candidates[:, 1]
-        mask = shapely.intersects_xy(geometry, x, y)
-        if exclude is not None:
-            mask &= ~shapely.intersects_xy(exclude, x, y)
-        return candidates[mask]
+    def inside(self, shape: BaseGeometry, excluding: BaseGeometry | None = None) -> np.ndarray:
+        """Return the points inside `shape` (its edge counts as inside) but not inside `excluding`."""
+        min_x, min_y, max_x, max_y = shape.bounds
+        first = np.searchsorted(self.points[:, 0], min_x, side="left")
+        after_last = np.searchsorted(self.points[:, 0], max_x, side="right")
+        nearby = self.points[first:after_last]
+        nearby = nearby[(nearby[:, 1] >= min_y) & (nearby[:, 1] <= max_y)]
+        x, y = nearby[:, 0], nearby[:, 1]
+        is_inside = shapely.intersects_xy(shape, x, y)
+        if excluding is not None:
+            is_inside &= ~shapely.intersects_xy(excluding, x, y)
+        return nearby[is_inside]

@@ -19,40 +19,45 @@ from pvcompute.data_models import BuildingResult, Footprint, RoofFace
 
 
 class OutputJsonReader:
-    def __init__(self, input_path: str | Path, output_path: str | Path):
-        self.input_path = Path(input_path)
-        self.output_path = Path(output_path)
+    """Reads output.json and the outlines from input.json and joins them per building."""
+
+    def __init__(self, input_json_path: str | Path, output_json_path: str | Path):
+        """Set the paths of input.json (outlines) and output.json (roofs and solar data)."""
+        self.input_json_path = Path(input_json_path)
+        self.output_json_path = Path(output_json_path)
 
     def read(self) -> list[BuildingResult]:
+        """Return every building of output.json with its outline and roof."""
         footprints = self._read_footprints()
         results = []
-        for building in self._load(self.output_path)["buildings"]:
+        for building in self._load_json(self.output_json_path)["buildings"]:
             building_id = building["id"]
-            footprint = footprints.get(building_id)
-            if footprint is None:
-                raise ValueError(f"building {building_id} from {self.output_path} is missing in {self.input_path}")
+            if building_id not in footprints:
+                raise ValueError(f"building {building_id} is in output.json but not in input.json")
             roof = building["roof"]
             if len(roof["faces"]) != len(roof["pv"]):
-                raise ValueError(f"building {building_id}: roof.faces and roof.pv differ in length")
+                raise ValueError(f"building {building_id}: roof.faces and roof.pv have different lengths")
             results.append(
                 BuildingResult(
-                    footprint=footprint,
+                    footprint=footprints[building_id],
                     z_ground=building["z_ground"],
-                    vertices=roof["vertices"],
-                    faces=[self._face(vertex_nos, pv) for vertex_nos, pv in zip(roof["faces"], roof["pv"])],
+                    roof_vertices=roof["vertices"],
+                    roof_faces=[self._roof_face(corners, pv) for corners, pv in zip(roof["faces"], roof["pv"])],
                     pv_energy=building["pv_energy"],
                 )
             )
         return results
 
     def _read_footprints(self) -> dict[str, Footprint]:
-        buildings = self._load(self.input_path)["buildings"]
+        """Return the outlines from input.json, keyed by building ID."""
+        buildings = self._load_json(self.input_json_path)["buildings"]
         return {b["id"]: Footprint(b["id"], Polygon(b["footprint"])) for b in buildings}
 
     @staticmethod
-    def _face(vertex_nos: list[int], pv: dict) -> RoofFace:
+    def _roof_face(corner_numbers: list[int], pv: dict) -> RoofFace:
+        """Join one entry of `roof.faces` (corner numbers) with the matching entry of `roof.pv` (solar data)."""
         return RoofFace(
-            vertex_nos=list(vertex_nos),
+            vertex_nos=list(corner_numbers),
             area=pv["area"],
             slope=pv["slope"],
             azimuth=pv["azimuth"],
@@ -61,6 +66,7 @@ class OutputJsonReader:
         )
 
     @staticmethod
-    def _load(path: Path) -> dict:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+    def _load_json(path: Path) -> dict:
+        """Read a JSON file."""
+        with open(path, encoding="utf-8") as file:
+            return json.load(file)

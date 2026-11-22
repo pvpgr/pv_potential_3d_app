@@ -21,7 +21,9 @@ from pvcompute.data_models import BuildingResult
 
 
 class BuildingRepository:
-    _UPSERT_BUILDING = """
+    """Writes BuildingResult objects to the tables building, roof_vertex and roof_face."""
+
+    INSERT_OR_UPDATE_BUILDING = """
         INSERT INTO building (id, footprint, z_ground, pv_energy)
         VALUES (%s, ST_GeomFromText(%s, 2180), %s, %s)
         ON CONFLICT (id) DO UPDATE
@@ -29,38 +31,42 @@ class BuildingRepository:
             z_ground = EXCLUDED.z_ground,
             pv_energy = EXCLUDED.pv_energy
     """
-    _DELETE_VERTICES = "DELETE FROM roof_vertex WHERE building_id = ANY(%s)"
-    _DELETE_FACES = "DELETE FROM roof_face WHERE building_id = ANY(%s)"
-    _INSERT_VERTEX = "INSERT INTO roof_vertex (building_id, vertex_no, x, y, z) VALUES (%s, %s, %s, %s, %s)"
-    _INSERT_FACE = """
+    DELETE_OLD_VERTICES = "DELETE FROM roof_vertex WHERE building_id = ANY(%s)"
+    DELETE_OLD_FACES = "DELETE FROM roof_face WHERE building_id = ANY(%s)"
+    INSERT_VERTEX = "INSERT INTO roof_vertex (building_id, vertex_no, x, y, z) VALUES (%s, %s, %s, %s, %s)"
+    INSERT_FACE = """
         INSERT INTO roof_face (building_id, face_no, vertex_nos, area, slope, azimuth, irradiation, energy)
         VALUES (%s, %s, %s::int[], %s, %s, %s, %s, %s)
     """
 
     def __init__(self, connection: psycopg.Connection):
+        """Use an open database connection (opening and closing it is the caller's job)."""
         self.connection = connection
 
     def save(self, buildings: Sequence[BuildingResult]) -> None:
-        """Store all buildings in one transaction: either all of them are saved or none."""
+        """Save all buildings in one transaction: either all of them are saved or none."""
         if not buildings:
             return
-        ids = [b.id for b in buildings]
-        building_rows = [(b.id, b.footprint.polygon.wkt, b.z_ground, b.pv_energy) for b in buildings]
-        vertex_rows = [
-            (b.id, vertex_no, x, y, z)
+        building_ids = [b.footprint.building_id for b in buildings]
+        building_rows = [
+            (b.footprint.building_id, b.footprint.polygon.wkt, b.z_ground, b.pv_energy)
             for b in buildings
-            for vertex_no, (x, y, z) in enumerate(b.vertices)
+        ]
+        vertex_rows = [
+            (b.footprint.building_id, vertex_no, x, y, z)
+            for b in buildings
+            for vertex_no, (x, y, z) in enumerate(b.roof_vertices)
         ]
         face_rows = [
-            (b.id, face_no, f.vertex_nos, f.area, f.slope, f.azimuth, f.irradiation, f.energy)
+            (b.footprint.building_id, face_no, f.vertex_nos, f.area, f.slope, f.azimuth, f.irradiation, f.energy)
             for b in buildings
-            for face_no, f in enumerate(b.faces)
+            for face_no, f in enumerate(b.roof_faces)
         ]
         with self.connection.transaction(), self.connection.cursor() as cursor:
-            cursor.executemany(self._UPSERT_BUILDING, building_rows)
-            cursor.execute(self._DELETE_VERTICES, (ids,))
-            cursor.execute(self._DELETE_FACES, (ids,))
+            cursor.executemany(self.INSERT_OR_UPDATE_BUILDING, building_rows)
+            cursor.execute(self.DELETE_OLD_VERTICES, (building_ids,))
+            cursor.execute(self.DELETE_OLD_FACES, (building_ids,))
             if vertex_rows:
-                cursor.executemany(self._INSERT_VERTEX, vertex_rows)
+                cursor.executemany(self.INSERT_VERTEX, vertex_rows)
             if face_rows:
-                cursor.executemany(self._INSERT_FACE, face_rows)
+                cursor.executemany(self.INSERT_FACE, face_rows)
